@@ -2,15 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 ربات مانیتورینگ آگهی‌های مالک شخصی دیوار - مشهد
-گروه دوم محله‌ها - نسخه GitHub Actions
+گروه دوم محله‌ها - نسخه زمان‌محور + فیلتر لیست
 """
 
 import os
-import time
 import random
-import sqlite3
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from dotenv import load_dotenv
 import requests
 from telegram import Bot
@@ -25,7 +24,6 @@ if not BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN تنظیم نشده است!")
 
 CHAT_IDS = [cid.strip() for cid in CHAT_IDS_RAW.split(",") if cid.strip()]
-
 if not CHAT_IDS:
     raise ValueError("هیچ CHAT_IDS تنظیم نشده است!")
 
@@ -38,44 +36,58 @@ HEADERS = {
     "Content-Type": "application/json",
 }
 
+DATA_DIR = Path("data")
+LAST_RUN_FILE = DATA_DIR / "last_run.txt"
+SEEN_FILE = DATA_DIR / "seen_tokens.txt"
+MAX_PAGES = 8
+MAX_SEEN_KEEP = 8000
 
-def init_db():
-    os.makedirs("data", exist_ok=True)
-    conn = sqlite3.connect("data/seen_posts.db")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS seen (
-            post_token TEXT PRIMARY KEY,
-            title TEXT,
-            district TEXT,
-            category TEXT,
-            seen_at TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
+LIST_AGENCY_KEYWORDS = [
+    "مشاور", "هلدینگ", "آژانس", "املاک", "مسکن",
+    "آقای ملک", "مشاور ملکی", "مشاور مسکن", "کارگزاری",
+    "مشاوره", "گروه املاک", "آژانس مسکن",
+]
 
 
-def is_seen(token: str) -> bool:
-    conn = sqlite3.connect("data/seen_posts.db")
-    cur = conn.execute("SELECT 1 FROM seen WHERE post_token = ?", (token,))
-    exists = cur.fetchone() is not None
-    conn.close()
-    return exists
+def ensure_data_dir():
+    DATA_DIR.mkdir(exist_ok=True)
 
 
-def mark_seen(token: str, title: str, district: str, category: str):
-    conn = sqlite3.connect("data/seen_posts.db")
-    conn.execute(
-        "INSERT OR IGNORE INTO seen (post_token, title, district, category, seen_at) VALUES (?, ?, ?, ?, ?)",
-        (token, title, district, category, datetime.utcnow().isoformat())
-    )
-    conn.commit()
-    conn.close()
+def load_last_run() -> datetime:
+    ensure_data_dir()
+    if LAST_RUN_FILE.exists():
+        try:
+            text = LAST_RUN_FILE.read_text(encoding="utf-8").strip()
+            return datetime.fromisoformat(text)
+        except Exception:
+            pass
+    return datetime.now(timezone.utc) - timedelta(hours=2)
 
 
-def search_divar(category: str, page: int = 1, last_post_date: int = None) -> dict:
+def save_last_run(dt: datetime):
+    ensure_data_dir()
+    LAST_RUN_FILE.write_text(dt.isoformat(), encoding="utf-8")
+
+
+def load_seen() -> set:
+    ensure_data_dir()
+    if not SEEN_FILE.exists():
+        return set()
+    try:
+        lines = SEEN_FILE.read_text(encoding="utf-8").splitlines()
+        return {line.strip() for line in lines if line.strip()}
+    except Exception:
+        return set()
+
+
+def save_seen(seen: set):
+    ensure_data_dir()
+    items = list(seen)[-MAX_SEEN_KEEP:]
+    SEEN_FILE.write_text("\n".join(items) + "\n", encoding="utf-8")
+
+
+def search_divar(category: str, page: int = 1, last_post_date=None) -> dict:
     url = "https://api.divar.ir/v8/postlist/w/search"
-
     payload = {
         "city_ids": [config.CITY_ID],
         "search_data": {
@@ -86,7 +98,6 @@ def search_divar(category: str, page: int = 1, last_post_date: int = None) -> di
             }
         }
     }
-
     if page > 1 and last_post_date is not None:
         payload["pagination_data"] = {
             "@type": "type.googleapis.com/post_list.PaginationData",
@@ -94,7 +105,6 @@ def search_divar(category: str, page: int = 1, last_post_date: int = None) -> di
             "page": page,
             "layer_page": page
         }
-
     try:
         resp = requests.post(url, headers=HEADERS, json=payload, timeout=25)
         resp.raise_for_status()
@@ -104,7 +114,7 @@ def search_divar(category: str, page: int = 1, last_post_date: int = None) -> di
         return {}
 
 
-def filter_districts(data: dict, category: str, cat_label: str) -> list:
+def extract_candidates(data: dict, category: str, cat_label: str) -> list:
     results = []
     widgets = data.get("list_widgets", [])
 
@@ -112,14 +122,26 @@ def filter_districts(data: dict, category: str, cat_label: str) -> list:
         if w.get("widget_type") != "POST_ROW":
             continue
 
-        payload = ((w.get("data") or {}).get("action") or {}).get("payload") or {}
+        d = w.get("data") or {}
+        payload = ((d.get("action") or {}).get("payload") or {})
         token = payload.get("token")
         if not token:
             continue
 
         web_info = payload.get("web_info") or {}
         district = web_info.get("district_persian") or ""
-        title = web_info.get("title") or (w.get("data") or {}).get("title") or ""
+        title = web_info.get("title") or d.get("title") or ""
+
+        list_text = " ".join([
+            str(title or ""),
+            str(d.get("top_description_text") or ""),
+            str(d.get("middle_description_text") or ""),
+            str(d.get("bottom_description_text") or ""),
+            str(web_info.get("title") or ""),
+        ]).replace("‌", " ")
+
+        if any(k in list_text for k in LIST_AGENCY_KEYWORDS):
+            continue
 
         if any(t in district for t in config.TARGET_DISTRICTS):
             results.append({
@@ -130,8 +152,7 @@ def filter_districts(data: dict, category: str, cat_label: str) -> list:
                 "catLabel": cat_label
             })
 
-    unique = {r["token"]: r for r in results}
-    return list(unique.values())
+    return results
 
 
 def fetch_post_details(token: str) -> dict:
@@ -159,20 +180,16 @@ def is_owner_and_format(details: dict, cand: dict):
 
     desc = ""
     rows = []
-
     for section in details.get("sections", []):
         for w in section.get("widgets", []):
             dt = w.get("data") or {}
             t = dt.get("@type", "")
-
             if t.endswith("DescriptionRowData") and dt.get("text"):
                 desc = dt["text"]
-
             if t.endswith("GroupInfoRow"):
                 for it in dt.get("items", []):
                     if it.get("title") and it.get("value"):
                         rows.append(f"{it['title']}: {it['value']}")
-
             if t.endswith("UnexpandableRowData") and dt.get("title") and dt.get("value"):
                 rows.append(f"{dt['title']}: {dt['value']}")
 
@@ -208,11 +225,7 @@ def is_owner_and_format(details: dict, cand: dict):
 
 async def send_message(bot: Bot, chat_id: str, message: str):
     try:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=message,
-            disable_web_page_preview=False
-        )
+        await bot.send_message(chat_id=chat_id, text=message, disable_web_page_preview=False)
         print(f"  ✅ پیام ارسال شد به {chat_id}")
     except Exception as e:
         print(f"  [ERROR] ارسال به {chat_id} ناموفق: {e}")
@@ -222,28 +235,36 @@ async def run_scraper():
     print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] شروع اسکرپ دیوار...")
     print(f"  تعداد مشترکین: {len(CHAT_IDS)}")
 
-    init_db()
-    bot = Bot(token=BOT_TOKEN)
+    last_run = load_last_run()
+    seen = load_seen()
+    print(f"  آخرین اسکرپ: {last_run.isoformat()}")
+    print(f"  تعداد توکن‌های ذخیره‌شده: {len(seen)}")
 
+    bot = Bot(token=BOT_TOKEN)
     all_candidates = []
+    run_started = datetime.now(timezone.utc)
 
     for cat in config.CATEGORIES:
         print(f"  → جستجو در دسته: {cat['label']}")
         last_post_date = None
 
-        for page in [1, 2, 3]:
+        for page in range(1, MAX_PAGES + 1):
             print(f"     صفحه {page}...")
             data = search_divar(cat["category"], page=page, last_post_date=last_post_date)
-
             if not data:
-                print(f"     صفحه {page} خالی یا خطا داشت، رد می‌شویم.")
+                print(f"     صفحه {page} خالی یا خطا داشت.")
                 break
 
-            last_post_date = data.get("last_post_date") or data.get("pagination", {}).get("last_post_date")
-
-            filtered = filter_districts(data, cat["category"], cat["label"])
-            print(f"     → {len(filtered)} آگهی بعد از فیلتر محله در این صفحه")
+            last_post_date = data.get("last_post_date") or (data.get("pagination") or {}).get("last_post_date")
+            filtered = extract_candidates(data, cat["category"], cat["label"])
+            print(f"     → {len(filtered)} آگهی بعد از فیلتر محله/لیست")
             all_candidates.extend(filtered)
+
+            widgets = data.get("list_widgets") or []
+            post_rows = [w for w in widgets if w.get("widget_type") == "POST_ROW"]
+            if not post_rows:
+                print("     دیگر آگهی جدیدی در این دسته نیست.")
+                break
 
             await asyncio.sleep(3)
 
@@ -252,25 +273,20 @@ async def run_scraper():
     unique = {c["token"]: c for c in all_candidates}
     candidates = list(unique.values())
     random.shuffle(candidates)
-    candidates = candidates[:config.MAX_PER_RUN]
+    candidates = candidates[: config.MAX_PER_RUN]
 
-    print(f"  تعداد کل کاندید بعد از فیلتر محله: {len(candidates)}")
+    print(f"  تعداد کل کاندید: {len(candidates)}")
 
     new_posts = []
     for cand in candidates:
-        if is_seen(cand["token"]):
+        if cand["token"] in seen:
             continue
 
         details = fetch_post_details(cand["token"])
         formatted = is_owner_and_format(details, cand)
 
         if formatted:
-            mark_seen(
-                formatted["post_token"],
-                formatted["title"],
-                formatted["district"],
-                formatted["category"]
-            )
+            seen.add(formatted["post_token"])
             new_posts.append(formatted)
             print(f"  ✅ آگهی جدید: {formatted['title'][:50]}...")
 
@@ -283,6 +299,9 @@ async def run_scraper():
             await send_message(bot, chat_id, post["message"])
             await asyncio.sleep(0.5)
 
+    save_last_run(run_started)
+    save_seen(seen)
+    print(f"  وضعیت ذخیره شد (last_run + {len(seen)} توکن)")
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] اسکرپ تمام شد.\n")
 
 
