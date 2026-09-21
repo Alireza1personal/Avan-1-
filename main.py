@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ربات مانیتورینگ آگهی‌های مالک شخصی دیوار - مشهد
-گروه دوم محله‌ها - نسخه زمان‌محور + فیلتر لیست
+نسخه گروه تلگرام + تاپیک (فروش / رهن‌اجاره)
 """
 
 import os
@@ -18,14 +18,26 @@ import config
 load_dotenv()
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_IDS_RAW = os.getenv("CHAT_IDS", "")
+CHAT_ID = os.getenv("CHAT_ID", "").strip()
+TOPIC_SELL = os.getenv("TOPIC_SELL", "").strip()
+TOPIC_RENT = os.getenv("TOPIC_RENT", "").strip()
 
 if not BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN تنظیم نشده است!")
+if not CHAT_ID:
+    raise ValueError("CHAT_ID گروه تنظیم نشده است!")
+if not TOPIC_SELL or not TOPIC_RENT:
+    raise ValueError("TOPIC_SELL و TOPIC_RENT باید تنظیم شوند!")
 
-CHAT_IDS = [cid.strip() for cid in CHAT_IDS_RAW.split(",") if cid.strip()]
-if not CHAT_IDS:
-    raise ValueError("هیچ CHAT_IDS تنظیم نشده است!")
+try:
+    TOPIC_SELL_ID = int(TOPIC_SELL)
+    TOPIC_RENT_ID = int(TOPIC_RENT)
+except ValueError:
+    raise ValueError("TOPIC_SELL و TOPIC_RENT باید عدد باشند!")
+
+# دسته‌های فروش و اجاره
+SELL_CATEGORIES = {"apartment-sell", "house-villa-sell"}
+RENT_CATEGORIES = {"apartment-rent", "house-villa-rent"}
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
@@ -84,6 +96,13 @@ def save_seen(seen: set):
     ensure_data_dir()
     items = list(seen)[-MAX_SEEN_KEEP:]
     SEEN_FILE.write_text("\n".join(items) + "\n", encoding="utf-8")
+
+
+def get_topic_id(category: str) -> int:
+    """بر اساس دسته، تاپیک مناسب را برمی‌گرداند"""
+    if category in SELL_CATEGORIES:
+        return TOPIC_SELL_ID
+    return TOPIC_RENT_ID
 
 
 def search_divar(category: str, page: int = 1, last_post_date=None) -> dict:
@@ -177,6 +196,7 @@ def is_owner_and_format(details: dict, cand: dict):
     title = cand["title"]
     district = cand["district"]
     cat_label = cand["catLabel"]
+    category = cand["category"]
 
     desc = ""
     rows = []
@@ -218,22 +238,29 @@ def is_owner_and_format(details: dict, cand: dict):
         "post_token": token,
         "title": title,
         "district": district,
-        "category": cand["category"],
+        "category": category,
         "message": "\n".join(lines)
     }
 
 
-async def send_message(bot: Bot, chat_id: str, message: str):
+async def send_message(bot: Bot, message: str, category: str):
+    topic_id = get_topic_id(category)
     try:
-        await bot.send_message(chat_id=chat_id, text=message, disable_web_page_preview=False)
-        print(f"  ✅ پیام ارسال شد به {chat_id}")
+        await bot.send_message(
+            chat_id=CHAT_ID,
+            text=message,
+            message_thread_id=topic_id,
+            disable_web_page_preview=False
+        )
+        print(f"  ✅ پیام ارسال شد به تاپیک {topic_id}")
     except Exception as e:
-        print(f"  [ERROR] ارسال به {chat_id} ناموفق: {e}")
+        print(f"  [ERROR] ارسال ناموفق: {e}")
 
 
 async def run_scraper():
     print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] شروع اسکرپ دیوار...")
-    print(f"  تعداد مشترکین: {len(CHAT_IDS)}")
+    print(f"  گروه: {CHAT_ID}")
+    print(f"  تاپیک فروش: {TOPIC_SELL_ID} | تاپیک اجاره: {TOPIC_RENT_ID}")
 
     last_run = load_last_run()
     seen = load_seen()
@@ -295,9 +322,8 @@ async def run_scraper():
     print(f"  تعداد آگهی جدید برای ارسال: {len(new_posts)}")
 
     for post in new_posts:
-        for chat_id in CHAT_IDS:
-            await send_message(bot, chat_id, post["message"])
-            await asyncio.sleep(0.5)
+        await send_message(bot, post["message"], post["category"])
+        await asyncio.sleep(0.5)
 
     save_last_run(run_started)
     save_seen(seen)
