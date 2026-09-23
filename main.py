@@ -49,7 +49,7 @@ HEADERS = {
 DATA_DIR = Path("data")
 LAST_RUN_FILE = DATA_DIR / "last_run.txt"
 SEEN_FILE = DATA_DIR / "seen_tokens.txt"
-MAX_PAGES = 12
+MAX_PAGES = 14
 MAX_SEEN_KEEP = 8000
 
 LIST_SKIP_KEYWORDS = [
