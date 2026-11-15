@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ربات دیوار (مشهد) → تلگرام + صف بررسی پنل مادر (Neway)
 
 API:
   POST {NEWAY_API_URL}/admin/mother-properties
@@ -23,7 +22,7 @@ from dotenv import load_dotenv
 from telegram import Bot
 
 import config
-from location_resolver import LocationResolver
+from location_resolver import LocationResolver, norm_nb
 
 load_dotenv()
 
@@ -223,6 +222,45 @@ def search_divar(category: str, page: int = 1, last_post_date=None) -> dict:
         return {}
 
 
+def is_excluded_district(district: str) -> bool:
+    """فردوسی و هر برچسبی که خودش را در لیست حذف‌شده‌ها دارد، هرگز اسکرپ نمی‌شود."""
+    d = fold_fa(district)
+    if not d:
+        return False
+    for raw in config.EXCLUDED_DISTRICTS:
+        ex = fold_fa(raw)
+        if ex and (ex == d or ex in d):
+            return True
+    return False
+
+
+def district_wanted(district: str) -> bool:
+    """محلهٔ دیوار جزو منطقه ۱ یا ۱۰ است؟ (با املای دیوار، نه فقط نام پنل)"""
+    if is_excluded_district(district):
+        return False
+    if MAPPER.knows_raw(district):
+        return True
+    fd = fold_fa(district)
+    nd = norm_nb(district)
+    if not fd and not nd:
+        return False
+    for t in config.TARGET_DISTRICTS:
+        ft = fold_fa(t)
+        if ft and ft in fd:
+            return True
+        nt = norm_nb(t)
+        if nd and nt and nd == nt:
+            return True
+    return False
+
+
+def canon_region(region: str) -> str:
+    """«10» / «منطقه ۱۰» / «۱» → رقم فارسی بدون پیشوند."""
+    r = fold_fa(region).replace("منطقه", "").strip()
+    r = r.translate(str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹"))
+    return r
+
+
 def extract_candidates(data: dict, category: str, cat_label: str) -> list:
     results = []
     for w in data.get("list_widgets", []):
@@ -245,7 +283,9 @@ def extract_candidates(data: dict, category: str, cat_label: str) -> list:
         ])
         if contains_any(list_text, config.LIST_SKIP_KEYWORDS):
             continue
-        if any(t in district for t in config.TARGET_DISTRICTS) or MAPPER.knows_raw(district):
+        if is_excluded_district(district):
+            continue
+        if district_wanted(district):
             results.append({
                 "token": token,
                 "district": district,
@@ -271,30 +311,83 @@ def fetch_post_details(token: str) -> dict:
 
 
 def extract_rows_and_desc(details: dict):
-    rows = {}
-    desc = ""
-    for section in details.get("sections", []):
-        for w in section.get("widgets", []):
-            dt = w.get("data") or {}
-            t = dt.get("@type", "")
-            if t.endswith("DescriptionRowData") and dt.get("text"):
-                desc = dt["text"]
-            if t.endswith("GroupInfoRow"):
-                for it in dt.get("items", []):
-                    if it.get("title") and it.get("value") is not None:
-                        rows[str(it["title"]).strip()] = str(it["value"]).strip()
-            if t.endswith("UnexpandableRowData") and dt.get("title") and dt.get("value") is not None:
-                rows[str(dt["title"]).strip()] = str(dt["value"]).strip()
-    return rows, desc
+    """ردیف‌های عنوان/مقدار، امکانات بولی (آسانسور و …) و متن توضیحات.
+
+    دیوار امکانات را گاهی به‌صورت value=«دارد/ندارد» می‌فرستد و گاهی
+    به‌صورت آیتم Feature با available=true/false. هر دو خوانده می‌شود.
+    """
+    rows: dict[str, str] = {}
+    features: dict[str, bool] = {}
+    descs: list[str] = []
+
+    def add_row(title, value):
+        if not isinstance(title, str):
+            return
+        title = title.strip()
+        if not title or len(title) > 80 or isinstance(value, (dict, list)) or value is None:
+            return
+        val = str(value).strip()
+        if val:
+            rows.setdefault(title, val)
+
+    def add_feature(title, available):
+        if not isinstance(title, str):
+            return
+        title = title.strip()
+        if not title:
+            return
+        if isinstance(available, bool):
+            features[title] = available
+        elif available in (0, 1):
+            features[title] = bool(available)
+
+    def walk(obj, feature_ctx=False):
+        if isinstance(obj, list):
+            for it in obj:
+                walk(it, feature_ctx)
+            return
+        if not isinstance(obj, dict):
+            return
+        wtype = str(obj.get("widget_type") or "")
+        dtype = str(obj.get("@type") or "")
+        here_feature = feature_ctx or ("FEATURE" in wtype.upper()) or ("Feature" in dtype)
+        if dtype.endswith("DescriptionRowData") and obj.get("text"):
+            descs.append(str(obj["text"]))
+        title = obj.get("title")
+        if title and "value" in obj:
+            add_row(title, obj.get("value"))
+        if title and "available" in obj:
+            add_feature(title, obj.get("available"))
+        elif here_feature and isinstance(title, str) and title.strip() and "value" not in obj:
+            features.setdefault(title.strip(), True)
+        for k, v in obj.items():
+            if k in ("action", "webengage", "image", "icon", "image_url", "button"):
+                continue
+            if isinstance(v, (dict, list)):
+                walk(v, here_feature)
+
+    for section in details.get("sections") or []:
+        walk(section)
+    desc = "\n".join(dict.fromkeys(d.strip() for d in descs if d and d.strip()))
+    return rows, features, desc
 
 
-def pick_row(rows: dict, *keys):
+def pick_row(rows: dict, *keys, exclude=()):
     folded = {fold_fa(k): v for k, v in rows.items()}
+    blocked = tuple(fold_fa(e) for e in exclude if e)
+
+    def skip(rk: str) -> bool:
+        return any(b and b in rk for b in blocked)
+
     for k in keys:
         fk = fold_fa(k)
-        if fk in folded:
+        if fk in folded and not skip(fk):
             return folded[fk]
+    for k in keys:
+        fk = fold_fa(k)
         for rk, rv in folded.items():
+            if skip(rk):
+                continue
             if fk in rk or rk in fk:
                 return rv
     return None
@@ -306,7 +399,171 @@ def pick_row(rows: dict, *keys):
 # DIRECTIONS:     شمالی | جنوبی | دونبش | سه‌نبش | دوممر | شرقی‌غربی
 # DOC_STATUS:     ready | inprogress | promissory
 # AMENITIES:      elevator | parking | terrace | storage
+# فقط مقدار true تیک می‌خورد؛ «ندارد» عمداً ارسال نمی‌شود (چک‌باکس خالی می‌ماند).
 # Location resolution is handled exclusively by LocationResolver (location_resolver.py).
+
+_AMENITY_SPECS = (
+    ("elevator", ("آسانسور", "اسانسور")),
+    ("parking", ("پارکینگ", "پارکنگ")),
+    ("terrace", ("تراس", "بالکن", "بالکون")),
+    ("storage", ("انباری",)),
+)
+_AMENITY_FA = {
+    "elevator": "آسانسور",
+    "parking": "پارکینگ",
+    "terrace": "تراس/بالکن",
+    "storage": "انباری",
+}
+_NUM_WORDS = (
+    ("ده", 10), ("نه", 9), ("هشت", 8), ("هفت", 7), ("شش", 6), ("شیش", 6),
+    ("پنج", 5), ("چهار", 4), ("سه", 3), ("دو", 2), ("یک", 1), ("یه", 1), ("تک", 1),
+)
+
+
+def _ascii_digits(s: str) -> str:
+    return str(s).translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789"))
+
+
+def _title_is_amenity(title: str, keywords) -> bool:
+    ft = fold_fa(title)
+    return any(fold_fa(k) == ft or fold_fa(k) in ft for k in keywords)
+
+
+def interpret_amenity_value(val) -> bool | None:
+    """True = دارد، False = ندارد، None = نامشخص."""
+    if isinstance(val, bool):
+        return val
+    if val is None:
+        return None
+    s = fold_fa(str(val))
+    if not s or s in ("-", "—", "نامشخص", "نامعلوم"):
+        return None
+    if any(n in s for n in ("ندارد", "نداره", "نیست", "فاقد", "بدون", "خیر", "false", "no")):
+        return False
+    if any(p in s for p in ("دارد", "داره", "هست", "بله", "true", "yes", "✓", "✔")):
+        return True
+    n = parse_int_fa(s)
+    if n is not None:
+        return n > 0
+    return None
+
+
+def _amenity_mentioned_positive(text: str, keyword: str) -> bool:
+    """ذکرِ بدون نفی. «آسانسور ندارد» / «بدون پارکینگ» / «نزدیک انباری» مثبت نیست."""
+    t = fold_fa(text)
+    fk = fold_fa(keyword)
+    if not fk:
+        return False
+    start = 0
+    while True:
+        i = t.find(fk, start)
+        if i < 0:
+            return False
+        before = t[max(0, i - 18):i]
+        after = t[i + len(fk): i + len(fk) + 22]
+        start = i + len(fk)
+        before_s = before.rstrip()
+        after_s = after.lstrip(" \t:：\\-–=،,.|/")
+        if any(before_s.endswith(n) for n in ("بدون", "فاقد", "عدم", "نداشتن")):
+            continue
+        if "نزدیک" in before or "مجاور" in before:
+            continue
+        if any(after_s.startswith(n) for n in ("ندارد", "نداره", "نداشت", "نیست", "نمی باشد", "نمیباشد", "نبود")):
+            continue
+        return True
+
+
+def map_amenities(rows: dict, features: dict, desc: str, title: str):
+    found: dict[str, bool] = {}
+    decided: set[str] = set()
+
+    for raw_title, avail in features.items():
+        for key, kws in _AMENITY_SPECS:
+            if key in decided:
+                continue
+            if _title_is_amenity(raw_title, kws):
+                decided.add(key)
+                if avail:
+                    found[key] = True
+
+    for raw_title, val in rows.items():
+        for key, kws in _AMENITY_SPECS:
+            if key in decided:
+                continue
+            if not _title_is_amenity(raw_title, kws):
+                continue
+            flag = interpret_amenity_value(val)
+            if flag is None:
+                continue
+            decided.add(key)
+            if flag:
+                found[key] = True
+
+    blob_parts = [title or "", desc or ""]
+    for raw_title, val in rows.items():
+        blob_parts.append(f"{raw_title}: {val}")
+    blob = "\n".join(blob_parts)
+    for key, kws in _AMENITY_SPECS:
+        if key in decided:
+            continue
+        if any(_amenity_mentioned_positive(blob, k) for k in kws):
+            found[key] = True
+
+    ordered = {k: True for k, _kws in _AMENITY_SPECS if found.get(k)}
+    return ordered or None
+
+
+def _number_word(token: str):
+    t = fold_fa(token)
+    for w, v in _NUM_WORDS:
+        if t == w:
+            return v
+    return None
+
+
+def map_units_per_floor(rows: dict, desc: str = "", title: str = ""):
+    raw = pick_row(
+        rows,
+        "تعداد واحد در طبقه",
+        "تعداد واحد هر طبقه",
+        "تعداد واحد در هر طبقه",
+        "واحد در طبقه",
+        "واحد هر طبقه",
+        "واحد در هر طبقه",
+    )
+    if raw:
+        n = parse_int_fa(raw)
+        if n and 0 < n <= 40:
+            return n
+        head = fold_fa(raw).split(" ")[0] if fold_fa(raw) else ""
+        word = _number_word(head)
+        if word:
+            return word
+
+    blob = fold_fa(f"{title}\n{desc}")
+    blob_d = _ascii_digits(blob)
+    for pat in (
+        r"(\d+)\s*واحد\s*(?:در|هر)\s*طبقه",
+        r"واحد\s*(?:در|هر)\s*طبقه\s*[:：]?\s*(\d+)",
+        r"تعداد\s*واحد\s*(?:در|هر)\s*طبقه\s*[:：]?\s*(\d+)",
+        r"هر\s*طبقه\s*(\d+)\s*واحد",
+        r"در\s*هر\s*طبقه\s*(\d+)",
+    ):
+        m = re.search(pat, blob_d)
+        if m:
+            n = int(m.group(1))
+            if 0 < n <= 40:
+                return n
+    m = re.search(
+        r"(ده|نه|هشت|هفت|شش|شیش|پنج|چهار|سه|دو|یک|یه|تک)\s*واحد\s*(?:در|هر)\s*طبقه",
+        blob,
+    )
+    if m:
+        return _number_word(m.group(1))
+    # «تک‌واحدی» در آگهی‌های مشهد یعنی یک واحد در طبقه
+    if re.search(r"تک\s*واحدی|تکواحدی|تک\s*واحد\s*(?:در|هر)\s*طبقه", blob):
+        return 1
+    return None
 
 
 def map_deal_type(category: str) -> str:
@@ -366,24 +623,6 @@ def map_doc_status(rows: dict, desc: str, title: str):
     return None
 
 
-def map_amenities(rows: dict, desc: str, title: str):
-    blob = fold_fa(f"{title} {desc} {' '.join(rows.values())}")
-    found = {}
-    if any(k in blob for k in ["آسانسور", "اسانسور"]):
-        found["elevator"] = True
-    if any(k in blob for k in ["پارکینگ", "پارکنگ"]):
-        found["parking"] = True
-    if any(k in blob for k in ["تراس", "بالکن"]):
-        found["terrace"] = True
-    if any(k in blob for k in ["انباری", "انبار "]):
-        found["storage"] = True
-    return found or None
-
-
-def map_units_per_floor(rows: dict):
-    return parse_int_fa(pick_row(rows, "تعداد واحد در طبقه", "واحد در طبقه", "واحدها در طبقه"))
-
-
 def is_owner_and_format(details: dict, cand: dict):
     """فقط personal + فیلتر سخت. خروجی: message تلگرام + panel_payload برای API."""
     we = details.get("webengage") or {}
@@ -396,8 +635,8 @@ def is_owner_and_format(details: dict, cand: dict):
     cat_label = cand["catLabel"]
     category = cand["category"]
 
-    rows, desc = extract_rows_and_desc(details)
-    haystack = f"{title} {desc} {' '.join(rows.values())}"
+    rows, features, desc = extract_rows_and_desc(details)
+    haystack = f"{title} {desc} {' '.join(rows.values())} {' '.join(features.keys())}"
 
     if contains_any(haystack, config.AGENCY_KEYWORDS):
         return None
@@ -414,11 +653,11 @@ def is_owner_and_format(details: dict, cand: dict):
     area_m = parse_int_fa(pick_row(rows, "متراژ", "متر", "زیربنا", "مساحت"))
     rooms = parse_int_fa(pick_row(rows, "تعداد اتاق", "اتاق", "خواب", "تعداد خواب", "تعداد اتاق‌ها"))
     year_built = parse_int_fa(pick_row(rows, "سال ساخت", "ساخت"))
-    floor = parse_int_fa(pick_row(rows, "طبقه", "طبقه ملک"))
-    units_per_floor = map_units_per_floor(rows)
+    floor = parse_int_fa(pick_row(rows, "طبقه", "طبقه ملک", exclude=("واحد",)))
+    units_per_floor = map_units_per_floor(rows, desc, title)
     direction = map_direction(rows, desc, title)
     doc_status = map_doc_status(rows, desc, title)
-    amenities = map_amenities(rows, desc, title)
+    amenities = map_amenities(rows, features, desc, title)
 
     # خرید و فروش → فقط price | رهن و اجاره → price=ودیعه + rentPrice=اجاره
     price = None
@@ -447,6 +686,12 @@ def is_owner_and_format(details: dict, cand: dict):
          else f"📍 {city} › منطقه {region} › {neighborhood}"),
         "👤 نوع آگهی‌دهنده: مالک (شخصی)",
     ]
+    if units_per_floor is not None:
+        lines.append(f"🏢 تعداد واحد در طبقه: {units_per_floor}")
+    if amenities:
+        labels = [_AMENITY_FA[k] for k in amenities if k in _AMENITY_FA]
+        if labels:
+            lines.append("✅ امکانات: " + "، ".join(labels))
     if rows:
         lines.append("")
         lines.append("📋 مشخصات:")
@@ -463,7 +708,7 @@ def is_owner_and_format(details: dict, cand: dict):
     panel_payload = {
         "title": (title or f"آگهی دیوار {token}")[:200],
         "city": city,                 # مشهد
-        "region": region,             # ۱ — خالی اگر نامشخص (needs_review)
+        "region": region,             # ۱ یا ۱۰ — خالی اگر نامشخص (needs_review)
         "neighborhood": neighborhood, # نام دقیق محله پنل — یا متن خام دیوار اگر needs_review
         "category": "new",
         "dealType": deal_type,
@@ -576,8 +821,38 @@ def submit_to_panel(payload: dict) -> str:
 
 # ── main ──────────────────────────────────────────────────────────────
 
+def pick_balanced(candidates: list, limit: int) -> list:
+    """سقف هر اجرا بین منطقه ۱ و ۱۰ تقسیم می‌شود تا منطقه ۱۰ پشت منطقه ۱ گم نشود."""
+    pools: dict[str, list] = {"۱۰": [], "۱": [], "_": []}
+    for cand in candidates:
+        district = cand.get("district") or ""
+        if is_excluded_district(district):
+            continue
+        try:
+            region = canon_region(MAPPER.resolve(district, cand.get("title") or "").region)
+        except Exception:
+            region = ""
+        pools[region if region in ("۱", "۱۰") else "_"].append(cand)
+    for bucket in pools.values():
+        random.shuffle(bucket)
+    picked: list = []
+    idx = {"۱۰": 0, "۱": 0, "_": 0}
+    while len(picked) < limit:
+        progressed = False
+        for key in ("۱۰", "۱", "_"):
+            i = idx[key]
+            if i < len(pools[key]) and len(picked) < limit:
+                picked.append(pools[key][i])
+                idx[key] = i + 1
+                progressed = True
+        if not progressed:
+            break
+    return picked
+
+
 async def run_scraper() -> None:
     print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] شروع اسکرپ دیوار...")
+    print("  منطقه‌ها: ۱ و ۱۰ | وضعیت پنل: pending (صف تأیید ادمین)")
     print(f"  گروه: {CHAT_ID}")
     print(f"  تاپیک فروش: {TOPIC_SELL_ID} | تاپیک اجاره: {TOPIC_RENT_ID}")
     if PANEL_ENABLED:
@@ -645,9 +920,7 @@ async def run_scraper() -> None:
         await asyncio.get_event_loop().run_in_executor(None, _jittered_sleep, 2)
 
     unique = {c["token"]: c for c in all_candidates}
-    candidates = list(unique.values())
-    random.shuffle(candidates)
-    candidates = candidates[: config.MAX_PER_RUN]
+    candidates = pick_balanced(list(unique.values()), config.MAX_PER_RUN)
     print(f"  تعداد کل کاندید: {len(candidates)}")
 
     new_posts = []
