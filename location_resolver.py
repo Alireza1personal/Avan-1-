@@ -60,6 +60,23 @@ def _qualifier(name: str) -> str:
     return fold_key(m.group(1)) if m else ""
 
 
+# پسوند رایجی که دیوار به محله‌های شهرک غرب می‌چسباند؛ در نام پنل گاهی هست و گاهی نیست.
+_GHARB_SUFFIX = re.compile(r"\s*[\(（]\s*شهرک\s*غرب\s*[\)）]\s*")
+
+
+def norm_nb(name: str) -> str:
+    """برابرسازی برای تطبیق: ي/ك، نیم‌فاصله، فاصله، و پسوند «(شهرک غرب)».
+
+    «استاد یوسفی (شهرک غرب)» و «استادیوسفی (شهرک غرب)» و «شهرک رازی (شهرک غرب)»
+    با «شهرک رازی(شهرک غرب)» یکی می‌شوند. پرانتزهای دیگر (مثل هفت تیر) دست نمی‌خورند.
+    """
+    s = fold_key(name)
+    if not s:
+        return ""
+    s = _GHARB_SUFFIX.sub("", s)
+    return re.sub(r"\s+", "", s)
+
+
 def _region_mentioned(region: str, text: str) -> bool:
     r = fold_key(region)
     if not r:
@@ -223,7 +240,8 @@ class LocationResolver:
 
     # B — live tree
     def _tree_candidates(self, key: str, city_f: str) -> list[Loc]:
-        exact, prefixed = [], []
+        exact, prefixed, normed = [], [], []
+        nk = norm_nb(key)
         for loc in self._nb.values():
             if fold_key(loc.city) != city_f:
                 continue
@@ -232,15 +250,28 @@ class LocationResolver:
                 exact.append(loc)
             elif n.startswith(key + "(") or n.startswith(key + " ("):
                 prefixed.append(loc)
-        return exact + prefixed
+            elif nk and norm_nb(loc.neighborhood) == nk:
+                normed.append(loc)
+        if exact:
+            seen = {id(c) for c in exact}
+            return exact + [p for p in prefixed if id(p) not in seen]
+        if normed:
+            uniq, seen = [], set()
+            for loc in normed:
+                if loc.nid in seen:
+                    continue
+                seen.add(loc.nid)
+                uniq.append(loc)
+            return uniq
+        return prefixed
 
     def _by_tree(self, key: str, city_f: str, text: str):
         cands = self._tree_candidates(key, city_f)
         if not cands:
             return "none", None
-        exact = [c for c in cands if fold_key(c.neighborhood) == key]
-        if len(exact) == 1 and len(cands) == 1:
-            return "ok", exact[0]
+        # یک کاندید (حتی اگر فقط با نرمال‌سازی «(شهرک غرب)» جور شده) یعنی ابهامی نیست
+        if len(cands) == 1:
+            return "ok", cands[0]
         loc = _pick_by_evidence(cands, text)
         return ("ok", loc) if loc else ("ambiguous", None)
 
@@ -248,6 +279,30 @@ class LocationResolver:
     def _by_static(self, key: str, city_f: str, text: str):
         if key and city_f != fold_key(config.CITY_NAME):
             return "none", None
+
+        def finish(names):
+            names = [n for n in dict.fromkeys(names) if n in config.PANEL_NEIGHBORHOODS]
+            if not names:
+                return "none", None
+            locs = []
+            for n in names:
+                region = config.NEIGHBORHOOD_TO_REGION.get(n)
+                if region:
+                    locs.append(Loc(config.CITY_NAME, str(region), n))
+            if not locs:
+                return "ambiguous", None
+            if len(names) == 1:
+                return ("ok", locs[0]) if len(locs) == 1 else ("ambiguous", None)
+            loc = _pick_by_evidence(locs, text)
+            return ("ok", loc) if loc else ("ambiguous", None)
+
+        # برابری نرمال (فاصله / نیم‌فاصله / پسوند شهرک غرب) — فقط اگر دقیقاً یک محله پنل بماند
+        nk = norm_nb(key)
+        if nk:
+            norm_hits = [n for n in config.PANEL_NEIGHBORHOODS if norm_nb(n) == nk]
+            if norm_hits:
+                return finish(norm_hits)
+
         panel = {fold_key(n): n for n in config.PANEL_NEIGHBORHOODS}
         aliases = {fold_key(a): n for a, n in config.DISTRICT_TO_PANEL.items()}
         prefixed = [n for fk, n in panel.items() if fk.startswith(key + "(") or fk.startswith(key + " (")]
@@ -258,17 +313,4 @@ class LocationResolver:
         else:
             hits = {n for a, n in aliases.items() if a and (a in key or key in a)}
             names = sorted(hits)
-        names = [n for n in names if n in config.PANEL_NEIGHBORHOODS]
-        if not names:
-            return "none", None
-        locs = []
-        for n in dict.fromkeys(names):
-            region = config.NEIGHBORHOOD_TO_REGION.get(n)
-            if region:
-                locs.append(Loc(config.CITY_NAME, str(region), n))
-        if not locs:
-            return "ambiguous", None
-        if len(names) == 1:
-            return ("ok", locs[0]) if len(locs) == 1 else ("ambiguous", None)
-        loc = _pick_by_evidence(locs, text)
-        return ("ok", loc) if loc else ("ambiguous", None)
+        return finish(names)
